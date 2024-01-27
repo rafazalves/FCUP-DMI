@@ -1,0 +1,350 @@
+---
+title: "Data Mining - Should we loan? Grupo 13"
+author: "Rafael Azevedo Alves (up202004476)"
+output: html_document
+date: "2023-12-06"
+---
+
+```{r setup, include=FALSE}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(stats)
+library(caTools)
+library(pROC)
+library(randomForest)
+library(e1071)
+
+account <- read.csv("account.csv", sep = ";")
+card_dev <- read.csv("card_dev.csv", sep = ";")
+client <- read.csv("client.csv", sep = ";")
+disp <- read.csv("disp.csv", sep = ";")
+district <- read.csv("district.csv", sep = ";")
+loan_dev <- read.csv("loan_dev.csv", sep = ";")
+trans_dev <- read.csv("trans_dev.csv", sep = ";")
+```
+
+## Introdução
+
+Um banco tem como objetivo melhorar a qualidade do seu serviço ao cliente. Um desafio particular que enfrenta é a ambiguidade em torno da identificação de bons clientes e maus clientes.
+
+Este projeto visa utilizar técnicas de extração de dados para ajudar os gestores do banco a compreender melhor os seus clientes e a identificar que tipo de cliente é um bom candidato a um empréstimo.
+
+
+## Data Understanding
+
+São fornecidos 7 ficheiros ".csv" que apresentam informação sobre cada conta, cliente, transação, cartão de crédito, empréstimo e cada distrito existente na base de dados dos clientes.
+
+Algumas perguntas que poderiam ser interessantes para verificar com os dados disponíveis são as seguintes:
+
+- Quantos clientes diferentes existem?
+
+```{r number_clients, echo=FALSE}
+count_client_ids <- client %>% distinct(client_id) %>% nrow()
+print(count_client_ids)
+```
+
+Existe um total de 5369 ids diferentes na tabela "cliente", logo existem, nesta base de dados, 5369 clientes diferentes.
+
+- Quantos loans foram efetuados?
+
+```{r number_loans, echo=FALSE}
+count_loan_ids <- loan_dev %>% distinct(loan_id) %>% nrow()
+print(count_loan_ids)
+```
+
+Existe um total de 328 ids diferentes na tabela "loan_dev", logo foram efetuados 328 loans.
+
+- Qual é a distribuição entre loan mal (-1) vs bem (1) sucedido?
+
+```{r goodbad_loans, echo=FALSE}
+loan_status_plot <- ggplot(loan_dev, aes(x = factor(status))) + geom_bar(stat = "count", fill = "skyblue") + labs(title = "Distribution of Loan Statuses", x = "Loan Status", y = "Count")
+print(loan_status_plot)
+```
+
+- Quantos loans foram efetuados por cada distrito?
+
+```{r loan_district, echo=FALSE}
+loan_district_plot <- ggplot(client, aes(x = factor(district_id))) + geom_bar(fill = "skyblue", color = "black") + labs(title = "Distribution of Clients by District", x = "District ID", y = "Number of Clients") + theme_minimal()
+print(loan_district_plot)
+```
+
+- Qual é a distribuição dos clientes por cada distrito?
+
+```{r client_district, echo=FALSE}
+loan_client <- loan_dev %>% inner_join(disp, by = "account_id") %>% inner_join(client, by = "client_id") %>% select(loan_id, district_id)
+loan_client <- loan_client %>% distinct(loan_id, .keep_all = TRUE) 
+loan_counts <- loan_client %>% group_by(district_id) %>% summarise(num_loans = n())
+client_district_plot <- ggplot(loan_counts, aes(x = factor(district_id), y = num_loans)) + geom_bar(stat = "identity", fill = "skyblue", color = "black") + labs(x = "District", y = "Number of Loans", title = "Loans by District")
+print(client_district_plot)
+```
+
+- Qual é a taxa de desemprego por cada distrito em 1995 e 1996?
+
+Em 1995:
+
+```{r unemploymant_district_95, echo=FALSE, warning=FALSE}
+district$unemploymant.rate..95 <- as.numeric(as.character(district$unemploymant.rate..95))
+mean_value <- mean(district$unemploymant.rate..95, na.rm = TRUE)
+district$unemploymant.rate..95[is.na(district$unemploymant.rate..95)] <- mean_value
+district$unemploymant.rate..95 <- round(district$unemploymant.rate..95, 2)
+unemploymant_district_95_plot <- ggplot(district, aes(x = code, y = unemploymant.rate..95)) + geom_point() + labs( title = "Relationship Between Districts and Unemployment Rate in 1995", x = "District Code", y = "Unemployment Rate in 1995" ) + scale_y_continuous(breaks = seq(0, max(district$unemploymant.rate..95), by = 0.5))
+print(unemploymant_district_95_plot)
+```
+
+Em 1996:
+
+```{r unemploymant_district_96, echo=FALSE}
+unemploymant_district_96_plot <- ggplot(district, aes(x = code, y = unemploymant.rate..96)) + geom_point() + labs( title = "Relationship Between Districts and Unemployment Rate in 1996", x = "District Code", y = "Unemployment Rate in 1996" ) + scale_y_continuous(breaks = seq(0, max(district$unemploymant.rate..96), by = 0.5))
+print(unemploymant_district_96_plot)
+```
+
+
+## Data Preparation
+
+Após analisar os ficheiros fornecidos foi verificado que:
+
+O único ficheiro que continha missing values era o “trans_dev.csv” nas colunas “operation”, “k_symbol”, “bank” e “account”.
+Para resolver esse problema, e uma vez que a única coluna que possa ser útil para verificar se um loan pode ser fornecido ou não é a “account”, foram colocados os missing values a 0 porque se existem missing values significa que só existe uma pessoa na conta dessa transação por isso a conta do companheiro sendo inexistente fica com o valor 0. 
+
+```{r trans_dev_account}
+trans_dev$account <- ifelse(is.na(trans_dev$account), 0, trans_dev$account)
+```
+
+As colunas “operation”, “k_symbol”, “bank” da tabela “trans_dev" foram eliminadas uma vez que não contribuem para verificar se um loan pode ser fornecido ou não.
+
+```{r trans_dev_delete}
+trans_dev <- trans_dev[, !(names(trans_dev) %in% c("operation", "k_symbol", "bank"))]
+```
+
+Na coluna “birth_number” da tabela “client” o valor referente ao mês em que a pessoa nasceu, dependendo do sexo do cliente, encontra-se normal (cliente do sexo masculino) ou mês+50 (cliente do sexo feminino). 
+Para resolver este problema, e visto que o sexo do cliente não tem relevância  para o que se pretende aferir neste projeto, verificamos quais os valores referentes ao mês que eram superiores a 12 e, nesses casos, subtraímos 50 ao seu valor para obter o mês correto.
+
+```{r birthNumber_client}
+# Converter para character para se conseguir manipular
+client <- mutate(client, birth_number = as.character(birth_number)) 
+# Função para transformar birth_number
+transform_birth_number <- function(number) {
+  if (nchar(number) == 6) {
+    # Extrair os dois dígitos do meio (referentes ao mês)
+    bb <- as.integer(substr(number, 3, 4))
+    
+    if (bb > 12) {
+      number <- paste(substr(number, 1, 2), sprintf("%02d", bb - 50), substr(number, 5, 6), sep = "")
+    }
+  }
+  return(number)
+}
+client <- mutate(client, birth_number = sapply(client$birth_number, transform_birth_number))
+# Converter 'birth_number' novamente para integer
+client$birth_number <- as.integer(client$birth_number)
+```
+
+Na tabela “district” foi verificado que as colunas “no..of.commited.crimes..95” e “unemploymant.rate..95” tinha o seu tipo definido como “char” e na coluna “unemploymant.rate..95” existia um valor desconhecido (“?”). 
+Para resolver estes problemas foram efetuadas as seguintes operações: 
+Para a coluna “no..of.commited.crimes..95” o seu tipo foi passado para “int";
+
+```{r preparationCrime_district}
+district$no..of.commited.crimes..95 <- as.integer(gsub("[^0-9]", "", district$no..of.commited.crimes..95))
+```
+
+Para a coluna “unemploymant.rate..95” o seu tipo foi passado para “num” e o valor desconhecido foi definido com a média de “unemploymant.rate..95” de todos os distritos.
+
+```{r preparationUnemploymant_district}
+# Transformar valores para o tipo numeric
+district$unemploymant.rate..95 <- as.numeric(as.character(district$unemploymant.rate..95))
+# Calcular a média de todos os distritos e substituir o valor desconhecido
+mean_value <- mean(district$unemploymant.rate..95, na.rm = TRUE)
+district$unemploymant.rate..95[is.na(district$unemploymant.rate..95)] <- mean_value
+# Calcular todos os valores com duas casas decimais
+district$unemploymant.rate..95 <- round(district$unemploymant.rate..95, 2)
+```
+
+## Descriptive Modelling
+
+O objetivo desta tarefa era usar um algoritmo de clustering num conjunto de variáveis consideradas úteis para fornecer uma descrição do tipo de clientes existentes nesta base de dados.
+Nesta tarefa, foi usado o algoritmo K-means para fazer clustering e as variáveis usadas foram o salário médio e a taxa de desemprego da tabela “district”. Foi, também, usado o “elbow method” para determinar o valor de K ideal, determinando então o número de clusters.
+
+```{r descriptive_modelling1, echo=FALSE}
+features <- district[, c("average.salary", "unemploymant.rate..95", "unemploymant.rate..96")]
+scaled_features <- scale(features)
+
+wcss <- vector()
+for (i in 1:10) {
+  kmeans_model <- kmeans(scaled_features, centers = i)
+  wcss[i] <- kmeans_model$tot.withinss
+}
+number_cluster_plot <- plot(1:10, wcss, type = "b", xlab = "Number of Clusters (K)", ylab = "Within Cluster Sum of Squares")
+```
+
+Aplicando o Elbow Method foi determinado que o K ideal seria 4.
+
+```{r descriptive_modelling2, echo=FALSE}
+optimal_k <- 4
+kmeans_model <- kmeans(scaled_features, centers = optimal_k)
+cluster_assignments <- kmeans_model$cluster
+plot(features[,1], features[,2], col = cluster_assignments, main = "K-means Clustering", xlab = "Average Salary", ylab = "Unemployment Rate")
+```
+
+## Predictive Modelling
+
+Após analisar e preparar os dados que nos são fornecidos foi definido o data set que será usado para a tarefa de classificação ("loan_final").
+
+```{r dataset_final, echo=FALSE, warning=FALSE}
+# Só o "OWNER" da conta pode pedir um loan
+filtered_disp <- subset(disp, type == "OWNER")
+
+# Associar cada loan_id a um cliente
+loan_final <- loan_dev %>% inner_join(filtered_disp, by = "account_id") %>% inner_join(client, by = "client_id") %>% select(loan_id, client_id, birth_number, date, amount, duration, payments, district_id)
+loan_final <- loan_final %>% distinct(loan_id, .keep_all = TRUE)
+
+# Calcular idade do cliente ao pedir o loan
+loan_final$client_age <- as.integer(substr(loan_final$date, 1, 2)) - as.integer(substr(loan_final$birth_number, 1, 2))
+condition <- as.integer(substr(loan_final$date, 3, 4)) < as.integer(substr(loan_final$birth_number, 3, 4)) | (as.integer(substr(loan_final$date, 3, 4)) > as.integer(substr(loan_final$birth_number, 3, 4))) & (as.integer(substr(loan_final$date, 5, 6)) < as.integer(substr(loan_final$birth_number, 5, 6)))
+loan_final$client_age <- ifelse(condition, loan_final$client_age - 1, loan_final$client_age)
+loan_final$client_age <- as.integer(loan_final$client_age)
+
+# Adicionar o AverageSalary e TaxaDesemprego e calcular qual usar (se o loan foi pedido em 1995 ou antes usar 95', se foi pedido depois usar 96')
+loan_final <- loan_final %>% inner_join(district, by = c("district_id" = "code")) %>% select(loan_id, client_id, client_age, date, amount, duration, payments, district_id, average.salary, unemploymant.rate..95, unemploymant.rate..96)
+loan_final <- loan_final %>% mutate( unemploymant.rate = ifelse(substr(as.character(date), 1, 2) <= "95", unemploymant.rate..95, unemploymant.rate..96) )
+loan_final <- subset(loan_final, select = -c(unemploymant.rate..95, unemploymant.rate..96))
+
+# Calcular balance da conta do cliente quando pediu o loan
+disp_filtered <- disp[disp$client_id %in% loan_final$client_id, ]
+disp_filtered <- subset(disp_filtered, select = -type)
+disp_filtered <- merge(disp_filtered, loan_final[, c("client_id", "date")], by = "client_id", all.x = TRUE)
+disp_filtered <- subset(disp_filtered, select = -disp_id)
+
+filtered_trans_dev <- trans_dev %>% semi_join(disp_filtered, by = c("account_id")) %>% filter(date < disp_filtered$date)
+filtered_trans_dev <- filtered_trans_dev %>% group_by(account_id) %>% filter(date == max(date))
+filtered_trans_dev <- filtered_trans_dev %>% group_by(account_id) %>% arrange(desc(type == "withdrawal")) %>% slice(1)
+filtered_trans_dev <- filtered_trans_dev %>% select(-trans_id, -date, -type, -amount, -account)
+
+disp_filtered <- left_join(disp_filtered, filtered_trans_dev, by = "account_id")
+disp_filtered <- disp_filtered %>% select(-account_id, -date)
+
+loan_final <- left_join(loan_final, disp_filtered, by = "client_id")
+loan_final <- loan_final %>% select(-date, -district_id)
+
+# Colocar "status" na tabela final e colocar valores a "0" caso loan mal sucedido e a "1" caso loan bem sucedido
+loan_status <- loan_dev %>% select(-account_id, -date, -amount, -duration, -payments)
+loan_final <- loan_final %>% left_join(loan_status, by = "loan_id")
+loan_final$status <- ifelse(loan_final$status == -1, 0, 1)
+
+# Transformar "status" em factor para os modelos
+loan_final$status <- factor(loan_final$status)
+
+str(loan_final)
+```
+
+Na tabela "loan_final" estão presentes os seguintes dados:
+
+- "loan_id", id de todos os loans feitos
+- "client_id", id de todos os clientes que pediram um loan
+- "client_age", idade do cliente quando pediu o loan
+- "amount", quanto foi o loan pedido
+- "duration", quanto tempo, em meses, o cliente tem para pagar o loan de volta
+- "payments", quanto é que o cliente tem de pagar em cada mês
+- "average.salary", salário médio do distrito onde o cliente vive
+- "unemploymant.rate", taxa de desemprego do distrito onde o cliente vive
+- "balance", quanto o cliente tinha na sua conta quando pediu o loan
+- "status", variável que indica se o loan foi bem sucedido ou não. Esta variável é a "Target Variable" que se deseja prever com base em outras colunas do conjunto de dados.
+
+Após definir o data set final foram considerados diferentes modelos de classificação:
+
+### - Random Forest Model
+O primeiro modelo a ser considerado foi o `Random Forest Model`, tendo sido feito da seguinte forma:
+
+```{r randomForest_model, warning=FALSE}
+set.seed(123)
+train_indices <- sample(1:nrow(loan_final), 0.7 * nrow(loan_final))
+train_data <- loan_final[train_indices, ]
+test_data <- loan_final[-train_indices, ]
+
+rf_model <- randomForest(status ~ client_age + amount + duration + payments + average.salary + unemploymant.rate + balance, data = train_data)
+
+predictions <- predict(rf_model, test_data)
+```
+
+Foi feita uma divisão dos dados num conjunto de treino (70%) e num conjunto de teste (30%), e foi aplicado um modelo Random Forest aos dados de treino que previu os dados de teste.
+Por fim, para se avaliar o modelo foi mostrada a sua "confusion matrix" e foi calculada a precisão e a AUC do modelo.
+
+```{r randomForest_model_accuracy, echo=FALSE, warning=FALSE}
+conf_matrix <- table(predictions, test_data$status)
+print(conf_matrix)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Accuracy:", accuracy))
+predicted_probs <- predict(rf_model, newdata = test_data, type = "prob")
+suppressMessages(roc_values <- roc(test_data$status, predicted_probs[, 2]))
+auc_value <- auc(roc_values)
+print(paste("AUC:", auc_value))
+```
+
+Ao analisar a confusion matrix deste modelo podemos concluir que, dos valores testados, existem 2 valores True Negative, 2 valores False Positive, 10 valores False Negative e 85 valores True Positive.
+
+### - Naive Bayes Model
+O segundo modelo a ser considerado foi o `Naive Bayes Model`, tendo sido feito da seguinte forma:
+
+```{r naiveBayes_model, warning=FALSE}
+set.seed(123)
+train_indices <- sample(1:nrow(loan_final), 0.7 * nrow(loan_final))
+train_data <- loan_final[train_indices, ]
+test_data <- loan_final[-train_indices, ]
+
+naive_bayes_model <- naiveBayes(status ~ client_age + amount + duration + payments + average.salary + unemploymant.rate + balance, data = train_data)
+
+predictions <- predict(naive_bayes_model, newdata = test_data)
+```
+
+Foi feita uma divisão dos dados num conjunto de treino (70%) e num conjunto de teste (30%), e foi aplicado um modelo Naive Bayes aos dados de treino que previu os dados de teste.
+Por fim, para se avaliar o modelo foi mostrada a sua "confusion matrix" e foi calculada a precisão e a AUC do modelo.
+
+```{r naiveBayes_model_accuracy, echo=FALSE, warning=FALSE}
+conf_matrix <- table(predictions, test_data$status)
+print(conf_matrix)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Accuracy:", accuracy))
+predicted_probs <- predict(naive_bayes_model, newdata = test_data, type = "raw")
+suppressMessages(roc_values <- roc(test_data$status, predicted_probs[, 2]))
+auc_value <- auc(roc_values)
+print(paste("AUC:", auc_value))
+```
+
+Ao analisar a confusion matrix deste modelo podemos concluir que, dos valores testados, existem 0 valores True Negative, 2 valores False Positive, 12 valores False Negative e 85 valores True Positive.
+
+### - Support Vector Machines (SVM) Model
+
+O terceiro modelo a ser considerado foi o `Support Vector Machines (SVM) Model`, tendo sido feito da seguinte forma:
+
+```{r svm_model, warning=FALSE}
+set.seed(123)
+train_indices <- sample(1:nrow(loan_final), 0.7 * nrow(loan_final))
+train_data <- loan_final[train_indices, ]
+test_data <- loan_final[-train_indices, ]
+
+svm_model <- svm(status ~ client_age + amount + duration + payments + average.salary + unemploymant.rate + balance, data = train_data, kernel = "radial")
+
+predictions <- predict(svm_model, newdata = test_data)
+```
+
+Foi feita uma divisão dos dados num conjunto de treino (70%) e num conjunto de teste (30%), e foi aplicado um modelo SVM aos dados de treino que previu os dados de teste.
+Por fim, para se avaliar o modelo foi mostrada a sua "confusion matrix" e foi calculada a precisão do modelo.
+
+```{r svm_model_accuracy, echo=FALSE, warning=FALSE}
+conf_matrix <- table(predictions, test_data$status)
+print(conf_matrix)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Accuracy:", accuracy))
+```
+
+Ao analisar a confusion matrix deste modelo podemos concluir que, dos valores testados, existem 0 valores True Negative, 0 valores False Positive, 12 valores False Negative e 87 valores True Positive.
+
+Posteriormente à análise dos modelos, foi decidido que o modelo final escolhido seria o `Random Forest Model`, pois, dos modelos avaliados, é o que apresenta maior precisão e AUC logo é o melhor modelo para se avaliar este data set.
+
+## Conclusões, Limitações e Trabalho Futuro
+
+Em suma, todas as tarefas propostas foram realizadas com sucesso e, através da realização deste trabalho, foi possível aprimorar conhecimentos na linguagem R, assim como perceber melhor os diferentes modelos de classificação existentes.
+
+Relativamente às limitações existentes e ao trabalho futuro podemos destacar o facto de que não é referido, nos dados do cliente, se o cliente está ou não desempregado e quanto recebe (apenas há referência à taxa de desemprego e ao salário médio do distrito onde se encontra) , o facto de que poderá também ser relevante haver dados sobre o estado de saúde de um cliente, pois é um fator, para além da idade, que também é usado pelos bancos para concluir se o cliente é ou não apto a um empréstimo e o facto de que não é referido qual o custo médio de vida de cada distrito, logo não é possível saber se, apesar de o cliente ter emprego, o pagamento é suficiente para se sustentar e pagar o empréstimo ao mesmo tempo.
+
+Com a inclusão destes dados referidos podemos ter assim, num trabalho futuro, uma previsão mais precisa sobre quais os clientes que são bons candidatos a um empréstimo.

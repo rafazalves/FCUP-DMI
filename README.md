@@ -1,1 +1,1 @@
-# FCUP-DMI
+Project of Data Mining I
